@@ -152,7 +152,6 @@ class Attention(nn.Module):
     Attributes:
         n_kv_heads (int): Number of key and value heads.
         n_heads (int): Number of query heads.
-        n_local_kv_heads (int): Number of local key and value heads.
         n_rep (int): Number of repetitions for local heads.
         head_dim (int): Dimension size of each attention head.
         wq (Linear): Linear transformation for queries.
@@ -181,8 +180,10 @@ class Attention(nn.Module):
         self.wo = nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
+        # print(f"n_heads: {self.n_heads}, n_kv_heads: {self.n_kv_heads}, n_rep: {self.n_rep}, head_dim: {self.head_dim},wq.shape: {self.wq.weight.shape}, wk.shape: {self.wk.weight.shape}, wv.shape: {self.wv.weight.shape}, wo.shape: {self.wo.weight.shape}")
 
     def init_weights(self, init_std: float):
+        torch.manual_seed(2025)
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
@@ -204,6 +205,7 @@ class Attention(nn.Module):
 
         """
         bsz, seqlen, _ = x.shape
+        # print(f"x.shape: {x.shape}")
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
@@ -219,12 +221,15 @@ class Attention(nn.Module):
         xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
+        # print(f"xq.shape: {xq.shape}, xk.shape: {xk.shape}, xv.shape: {xv.shape}")
         # we use casual mask for training
         output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
+        # print(f"1_output.shape: {output.shape}")
         output = output.transpose(
             1, 2
         ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
         output = output.view(bsz, seqlen, -1)
+        # print(f"2_output.shape: {output.shape}")
         return self.wo(output)
 
 
@@ -267,6 +272,7 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(self, init_std: float):
+        torch.manual_seed(2025)
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
         for linear in (self.w2, self.w3):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
@@ -438,6 +444,7 @@ class Transformer(nn.Module):
         """
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
+        # print(f"tokens.shape: {tokens.shape}, h.shape: {h.shape}")
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[0:seqlen]
 

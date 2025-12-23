@@ -32,6 +32,13 @@ def set_modules_to_backward_prefetch(model, num_to_backward_prefetch):
         ]
         layer.set_modules_to_backward_prefetch(layers_to_prefetch)
 
+def optimize_type(optimizer, optimizer_name):
+    print(f"dtype of optimizer : {optimizer_name}")
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            state = optimizer.state[p]
+            if len(state) and 'exp_avg' in state:
+                print(f"{p.shape}: exp_avg dtype={state['exp_avg'].dtype}, exp_avg_sq dtype={state['exp_avg_sq'].dtype}")
 
 def main(args):
     _min_gpu_count = 2
@@ -42,7 +49,7 @@ def main(args):
     if torch.accelerator.is_available():
         device_type = torch.accelerator.current_accelerator()
         device = torch.device(f"{device_type}:{rank}")
-        torch.accelerator.device_index(rank)
+        torch.cuda.set_device(rank)
         print(f"Running on rank {rank} on device {device}")
     else:
         device = torch.device("cpu")
@@ -64,6 +71,7 @@ def main(args):
     )
     with torch.device("meta"):
         model = Transformer(model_args)
+    # model.enable_gradient_checkpointing()
     fsdp_kwargs = {}
     if args.mixed_precision:
         fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
@@ -94,15 +102,17 @@ def main(args):
     if checkpointer.last_training_time is not None:
         checkpointer.load_optim(model, optim)
 
-    for _ in range(10):
-        if args.explicit_prefetching:
-            model.unshard()
-        x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-        loss = model(x).sum()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optim.step()
-        optim.zero_grad()
+    for _ in range(1):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
+            if args.explicit_prefetching:
+                model.unshard()
+            x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+            loss = model(x).sum()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optim.step()
+            optimize_type(optim, "optim")
+            optim.zero_grad()
 
     checkpointer.save(model, optim)
     torch.distributed.destroy_process_group()

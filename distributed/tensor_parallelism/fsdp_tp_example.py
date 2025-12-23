@@ -82,7 +82,7 @@ device_type = torch.accelerator.current_accelerator().type
 # Second dim is the tensor parallel dimension.
 device_mesh = init_device_mesh(device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
 
-rank_log(_rank, logger, f"Device Mesh created: {device_mesh=}")
+rank_log(_rank, logger, f"Device Mesh created: {device_mesh}")
 tp_mesh = device_mesh["tp"]
 dp_mesh = device_mesh["dp"]
 
@@ -93,7 +93,7 @@ dp_mesh = device_mesh["dp"]
 dp_rank = dp_mesh.get_local_rank()
 
 # create model and move it to GPU - initdevice_type_mesh has already mapped GPU ids.
-simple_llama2_config = ModelArgs(dim=256, n_layers=2, n_heads=16, vocab_size=32000)
+simple_llama2_config = ModelArgs(dim=256, n_layers=2, n_heads=4, vocab_size=320)
 
 model = Transformer.from_model_args(simple_llama2_config).to(device_type)
 
@@ -148,7 +148,7 @@ for layer_id, transformer_block in enumerate(model.layers):
 # Init FSDP using the dp device mesh
 sharded_model = fully_shard(model, mesh=dp_mesh)
 
-rank_log(_rank, logger, f"Model after parallelization {sharded_model=}\n")
+rank_log(_rank, logger, f"Model after parallelization {sharded_model}\n")
 
 # Create an optimizer for the parallelized and sharded model.
 lr = 3e-3
@@ -159,13 +159,13 @@ optimizer = torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=True)
 # Perform a num of iterations of forward/backward
 # and optimizations for the sharded module.
 rank_log(_rank, logger, "\nStarting 2D training...")
-num_iterations = 10
+num_iterations = 1
 batch_size = 2
 
 for i in range(num_iterations):
     # seeding with dp_rank to ensure identical inputs for TP groups
     torch.manual_seed(i + dp_rank)
-    inp = torch.randint(32000, (8, 256), device=device_type)
+    inp = torch.randint(320, (8, 2), device=device_type)
 
     output = sharded_model(inp)
     output.sum().backward()
