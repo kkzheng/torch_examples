@@ -7,6 +7,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+import torch.distributed as dist
+from communication import minimal_pad_to_divisible, _All2All, _Allgather
 
 
 @dataclass
@@ -25,6 +27,9 @@ class ModelArgs:
     # If `True`, then each transformer block init uses its layer ID, and if
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
+    sp_size: int = 1
+    sp_group: torch.distributed.distributed_c10d.ProcessGroup = None
+    
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -94,9 +99,15 @@ def apply_rotary_emb(
     """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    if torch.distributed.get_rank() == 0:
+        print(f"xq.shape: {xq.shape}, xq_.shape: {xq_.shape}, xk_.shape: {xk_.shape}, freqs_cis.shape: {freqs_cis.shape}")
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    if torch.distributed.get_rank() == 0:
+        print(f"xq.shape: {xq.shape}, xq_.shape: {xq_.shape}, xk_.shape: {xk_.shape}, freqs_cis.shape: {freqs_cis.shape}")
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
+    if torch.distributed.get_rank() == 0:
+        print(f"xq_out.shape: {xq_out.shape}, xk_out.shape: {xk_out.shape}")
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -232,6 +243,120 @@ class Attention(nn.Module):
         # print(f"2_output.shape: {output.shape}")
         return self.wo(output)
 
+class AttentionDist(nn.Module):
+    """
+    Multi-head attention module.
+
+    Args:
+        model_args (ModelArgs): Model configuration arguments.
+
+    Attributes:
+        n_kv_heads (int): Number of key and value heads.
+        n_heads (int): Number of query heads.
+        n_rep (int): Number of repetitions for local heads.
+        head_dim (int): Dimension size of each attention head.
+        wq (Linear): Linear transformation for queries.
+        wk (Linear): Linear transformation for keys.
+        wv (Linear): Linear transformation for values.
+        wo (Linear): Linear transformation for output.
+
+    """
+
+    def __init__(self, model_args: ModelArgs):
+        super().__init__()
+        self.n_heads = model_args.n_heads
+        self.n_kv_heads = (
+            model_args.n_heads
+            if model_args.n_kv_heads is None
+            else model_args.n_kv_heads
+        )
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.head_dim = model_args.dim // model_args.n_heads
+
+        self.wq = nn.Linear(
+            model_args.dim, model_args.n_heads * self.head_dim, bias=False
+        )
+        self.wk = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(model_args.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(
+            model_args.n_heads * self.head_dim, model_args.dim, bias=False
+        )
+        # print(f"n_heads: {self.n_heads}, n_kv_heads: {self.n_kv_heads}, n_rep: {self.n_rep}, head_dim: {self.head_dim},wq.shape: {self.wq.weight.shape}, wk.shape: {self.wk.weight.shape}, wv.shape: {self.wv.weight.shape}, wo.shape: {self.wo.weight.shape}")
+
+    def init_weights(self, init_std: float):
+        torch.manual_seed(2025)
+        for linear in (self.wq, self.wk, self.wv):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        sp_size: int = 1,
+        sp_group: torch.distributed.distributed_c10d.ProcessGroup = None
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+        if torch.distributed.get_rank() == 0:
+            print(f"sp_size: {sp_size}, x.shape: {x.shape}")
+        bsz, seqlen, _ = x.shape
+        # print(f"x.shape: {x.shape}")
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+
+        if torch.distributed.get_rank() == 0:
+            # print(f"xq.shape: {xq.shape}, xk.shape: {xk.shape}, xv.shape: {xv.shape}")
+            pass
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        
+        if torch.distributed.get_rank() == 0:
+            print(f"xq.shape: {xq.shape}, xk.shape: {xk.shape}, xv.shape: {xv.shape}")
+        
+        if sp_size > 1:
+            xq = _All2All.apply(xq, 1, 2, sp_group, False)
+            xk = _All2All.apply(xk, 1, 2, sp_group, False)
+            xv = _All2All.apply(xv, 1, 2, sp_group, False)
+            pass
+
+        if torch.distributed.get_rank() == 0:
+            print(f"xq.shape: {xq.shape}, xk.shape: {xk.shape}, xv.shape: {xv.shape}")
+        # we use casual mask for training
+        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
+        
+        if sp_size > 1:
+            output = _All2All.apply(output, 2, 1, sp_group, False)
+            pass
+        
+        if torch.distributed.get_rank() == 0:
+            print(f"1_output.shape: {output.shape}")
+        output = output.transpose(
+            1, 2
+        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
+        output = output.view(bsz, seqlen, -1)
+        if torch.distributed.get_rank() == 0:
+            print(f"2_output.shape: {output.shape}")
+        return self.wo(output)
+
 
 class FeedForward(nn.Module):
     """
@@ -350,6 +475,79 @@ class TransformerBlock(nn.Module):
         self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 
+class TransformerBlockDist(nn.Module):
+    """
+    TransformerBlock Module
+
+    Args:
+        layer_id (int): Identifier for the layer.
+        model_args (ModelArgs): Model configuration arguments.
+
+    Attributes:
+        n_heads (int): Number of attention heads.
+        dim (int): Dimension size of the model.
+        head_dim (int): Dimension size of each attention head.
+        attention (Attention): Attention module.
+        feed_forward (FeedForward): FeedForward module.
+        layer_id (int): Identifier for the layer.
+        attention_norm (RMSNorm): Layer normalization for attention output.
+        ffn_norm (RMSNorm): Layer normalization for feedforward output.
+
+    """
+
+    def __init__(self, layer_id: int, model_args: ModelArgs):
+        super().__init__()
+        self.n_heads = model_args.n_heads
+        self.dim = model_args.dim
+        self.attention = AttentionDist(model_args)
+        self.feed_forward = FeedForward(
+            dim=model_args.dim,
+            hidden_dim=4 * model_args.dim,
+            multiple_of=model_args.multiple_of,
+            ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+        )
+        self.layer_id = layer_id
+        self.num_layers = model_args.n_layers
+
+        self.attention_norm = RMSNorm(
+            dim=model_args.dim, eps=model_args.norm_eps
+        )
+        self.ffn_norm = RMSNorm(
+            dim=model_args.dim, eps=model_args.norm_eps
+        )
+
+        if model_args.depth_init:
+            self.weight_init_std = 0.02 / (2 * (self.layer_id + 1)) ** 0.5
+        else:
+            self.weight_init_std = 0.02 / (2 * self.num_layers) ** 0.5
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        sp_size: int = 1,
+        sp_group: torch.distributed.distributed_c10d.ProcessGroup = None
+    ):
+        """
+        Perform a forward pass through the TransformerBlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and feedforward layers.
+
+        """
+        h = x + self.attention(self.attention_norm(x), freqs_cis, sp_size=sp_size, sp_group=sp_group)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+    def init_weights(self):
+        for norm in (self.attention_norm, self.ffn_norm):
+            norm.reset_parameters()
+        self.attention.init_weights(self.weight_init_std)
+        self.feed_forward.init_weights(self.weight_init_std)
 
 class Transformer(nn.Module):
     """
@@ -376,6 +574,8 @@ class Transformer(nn.Module):
         self.vocab_size = model_args.vocab_size
         self.n_layers = model_args.n_layers
         self.model_dim = model_args.dim
+        self.sp_size = model_args.sp_size
+        self.sp_group = model_args.sp_group
 
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
         self.register_buffer(
@@ -388,8 +588,13 @@ class Transformer(nn.Module):
             ),
         )
         self.layers = torch.nn.ModuleList()
+        if torch.distributed.get_rank() == 0:
+            print(f"model_args.sp_size: {model_args.sp_size}, world_size: {torch.distributed.get_world_size(group=model_args.sp_group)}")
         for layer_id in range(model_args.n_layers):
-            self.layers.append(TransformerBlock(layer_id, model_args))
+            if model_args.sp_size > 1:
+                self.layers.append(TransformerBlockDist(layer_id, model_args))
+            else:
+                self.layers.append(TransformerBlock(layer_id, model_args))
 
         self.norm = RMSNorm(
             dim=model_args.dim, eps=model_args.norm_eps
@@ -444,12 +649,27 @@ class Transformer(nn.Module):
         """
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        # print(f"tokens.shape: {tokens.shape}, h.shape: {h.shape}")
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[0:seqlen]
+        if self.sp_size > 1:
+            rank_in_sp_group = dist.get_group_rank(self.sp_group, dist.get_rank())
+            h, tk_padding_len = minimal_pad_to_divisible(h, self.sp_size, dim=1, pad_value=0)
+            h = torch.chunk(h, self.sp_size, dim=1)[rank_in_sp_group]
+            freqs_cis = torch.chunk(freqs_cis, self.sp_size, dim=0)[rank_in_sp_group]
+            
+        if torch.distributed.get_rank() == 0:
+            print(f"tokens.shape: {tokens.shape}, h.shape: {h.shape}, freqs_cis.shape: {freqs_cis.shape}")
 
         for layer in self.layers:
-            h = layer(h, freqs_cis)
+            if self.sp_size > 1:
+                h = layer(h, freqs_cis, sp_size=self.sp_size, sp_group=self.sp_group)
+            else:
+                h = layer(h, freqs_cis)
+        if self.sp_size > 1:
+            h = _Allgather.apply(h, 1, self.sp_group, False)
+            pass
+        if torch.distributed.get_rank() == 0:
+            print(f"tokens.shape: {tokens.shape}, h.shape: {h.shape}, freqs_cis.shape: {freqs_cis.shape}")
         h = self.norm(h)
         output = self.output(h).float()
         return output

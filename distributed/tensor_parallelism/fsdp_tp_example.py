@@ -160,7 +160,6 @@ optimizer = torch.optim.AdamW(sharded_model.parameters(), lr=lr, foreach=True)
 # and optimizations for the sharded module.
 rank_log(_rank, logger, "\nStarting 2D training...")
 num_iterations = 1
-batch_size = 2
 
 for i in range(num_iterations):
     # seeding with dp_rank to ensure identical inputs for TP groups
@@ -171,6 +170,7 @@ for i in range(num_iterations):
     output.sum().backward()
     optimizer.step()
     rank_log(_rank, logger, f"2D iter {i} complete")
+    rank_log(_rank, logger, f"inp.shape is {inp.shape}, output.shape is {output.shape}")
 
 rank_log(_rank, logger, "2D training successfully completed!")
 

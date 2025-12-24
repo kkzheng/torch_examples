@@ -20,14 +20,14 @@ from llama2_model import Transformer, ModelArgs
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed._tensor import Shard, Replicate
 
-tp_size = 2
 logger = get_logger()
 
 # understand world topology
 _rank = int(os.environ["RANK"])
 _world_size = int(os.environ["WORLD_SIZE"])
 
-dp_size = _world_size // tp_size
+dp_size = 1
+tp_size = _world_size
 device_type = torch.accelerator.current_accelerator().type
 
 device_mesh = init_device_mesh(device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
@@ -35,6 +35,10 @@ device_mesh = init_device_mesh(device_type, (dp_size, tp_size), mesh_dim_names=(
 rank_log(_rank, logger, f"Device Mesh created: {device_mesh}")
 tp_mesh = device_mesh["tp"]
 dp_mesh = device_mesh["dp"]
+sp_group = tp_mesh.get_group()
+
+if torch.distributed.get_rank() == 0:
+    print(f"sp_group: {sp_group}, type: {type(sp_group)}")
 
 def normal():
     simple_llama2_config = ModelArgs(dim=256, n_layers=2, n_heads=4, vocab_size=320)
@@ -48,23 +52,57 @@ def normal():
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, foreach=True)
 
     num_iterations = 1
-    batch_size = 2
 
     for i in range(num_iterations):
         torch.manual_seed(2025)
-        inp = torch.randint(320, (8, 2), device=device_type)
+        inp = torch.randint(320, (8, 12), device=device_type)
         output = model(inp)
         output.sum().backward()
         optimizer.step()
         rank_log(_rank, logger, f"iter {i} complete")
 
     rank_log(_rank, logger, "training successfully completed!")
-    rank_log(_rank, logger, f"output is {output}")
+    # rank_log(_rank, logger, f"output is {output}")
+    rank_log(_rank, logger, f"inp.shape is {inp.shape}, output.shape is {output.shape}")
+    return output
+
+# reference: 
+# https://github1s.com/deepspeedai/DeepSpeed/tree/master/
+# https://zhuanlan.zhihu.com/p/4496065391
+
+def sp():
+    simple_llama2_config = ModelArgs(dim=256, n_layers=2, n_heads=4, vocab_size=320, sp_size=tp_size, sp_group=sp_group)
+    model = Transformer.from_model_args(simple_llama2_config).to(device_type)
+    model.init_weights()
+
+    rank_log(_rank, logger, f"Model {model}\n")
+
+    lr = 3e-3
+    rank_log(_rank, logger, f"Creating AdamW optimizer with learning rate {lr}")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, foreach=True)
+
+    num_iterations = 1
+
+    for i in range(num_iterations):
+        torch.manual_seed(2025)
+        inp = torch.randint(320, (8, 12), device=device_type)
+        output = model(inp)
+        output.sum().backward()
+        optimizer.step()
+        rank_log(_rank, logger, f"iter {i} complete")
+
+    rank_log(_rank, logger, "training successfully completed!")
+    # rank_log(_rank, logger, f"output is {output}")
     rank_log(_rank, logger, f"inp.shape is {inp.shape}, output.shape is {output.shape}")
     return output
 
 if __name__ == "__main__":
     output = normal()
+    output_sp = sp()
+    if torch.distributed.get_rank() == 0:
+        # print(f"output is {output}, output_sp is {output_sp}")
+        print(f"outputs equal: {torch.allclose(output, output_sp, atol=1e-6, rtol=1e-6)}")
+        pass
     if dist.is_initialized():
         dist.destroy_process_group()
         
