@@ -1,5 +1,7 @@
 import argparse
 import os
+from tqdm import tqdm
+import time
 
 import torch
 from checkpoint import Checkpointer
@@ -102,7 +104,14 @@ def main(args):
     if checkpointer.last_training_time is not None:
         checkpointer.load_optim(model, optim)
 
-    for _ in range(1):
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    num_iters = 50
+    pbar = tqdm(range(num_iters), desc="Training", unit="step")
+    for i in pbar:
+        start_event.record()
+        
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
             if args.explicit_prefetching:
                 model.unshard()
@@ -111,8 +120,18 @@ def main(args):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
-            optimize_type(optim, "optim")
+            # optimize_type(optim, "optim")
             optim.zero_grad()
+        
+        end_event.record()
+        torch.cuda.synchronize()
+        step_time = start_event.elapsed_time(end_event)
+
+        pbar.write(
+            f"[{i+1}/{num_iters}], "
+            f"time={step_time:.2f} ms, "
+            f"loss={loss.item():.4f}"
+        )
 
     checkpointer.save(model, optim)
     torch.distributed.destroy_process_group()
