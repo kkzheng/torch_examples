@@ -11,6 +11,7 @@ os.environ["TORCHDYNAMO_VERBOSE"] = "1"
 # os.environ["TORCH_LOGS"] = "guards"
 # os.environ["TORCH_LOGS"] = "recompiles"
 # os.environ["TORCH_LOGS"] = "dynamic"
+# os.environ["TORCH_LOGS"] = "trace_bytecode,trace_source,graph_code"
 
 torch._logging.set_logs(graph_breaks=True)
 os.system("rm -rf ./torch_compile_debug")
@@ -393,11 +394,28 @@ def fn_new(x):
         (x,),
     )
 
+# ref: https://docs.pytorch.org/docs/stable/compile/programming_model.fullgraph_true.html
+def g(x):
+    y = x.sin()
+    torch._dynamo.graph_break()
+    z = y.cos()
+    return z
+
+@torch.compile(fullgraph=True)
+def f(xs):
+    w = xs.sin()
+    return torch._dynamo.nonstrict_trace(g)(w)
+
 if __name__ == "__main__":
     # fn1()
     torch._dynamo.config.capture_scalar_outputs = True
-    print(fn_new(torch.ones(3, 3)))
+    # print(fn_new(torch.ones(3, 3)))
+    
+    xs = torch.tensor(1.)
+    out = f(xs)
+    print(out)
 
+# python -m torch.utils.bottleneck torch_compiler.py
 
 # pip install tlparse
 # TORCH_TRACE="/apdcephfs_zwfy/share_303204533/liamjhzhang/tracedir" python torch_compiler.py 
