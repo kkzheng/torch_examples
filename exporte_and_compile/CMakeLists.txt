@@ -3,7 +3,7 @@ project(aoti_example)
 
 find_package(Torch REQUIRED)
 
-add_executable(aoti_example infer.cc)
+add_executable(aoti_example torch_infer.cc)
 
 # add_custom_command(
 #     OUTPUT model.pt2

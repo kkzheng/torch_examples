@@ -407,13 +407,13 @@ def f(xs):
     return torch._dynamo.nonstrict_trace(g)(w)
 
 if __name__ == "__main__":
-    # fn1()
+    fn1()
     torch._dynamo.config.capture_scalar_outputs = True
     # print(fn_new(torch.ones(3, 3)))
     
     xs = torch.tensor(1.)
-    out = f(xs)
-    print(out)
+    # out = f(xs)
+    # print(out)
 
 # python -m torch.utils.bottleneck torch_compiler.py
 
