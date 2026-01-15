@@ -33,12 +33,13 @@ def main():
     for _ in range(1):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
             x = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-            loss = model(x).sum()
+            output = model(x)
+            loss = output.sum()
+            print(f"output.shape: {output.shape}, loss: {loss}")
             loss.backward()
             optim.step()
             optim.zero_grad()
 
-    print("Done")
     torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":

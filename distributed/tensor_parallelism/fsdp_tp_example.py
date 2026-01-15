@@ -145,6 +145,33 @@ for layer_id, transformer_block in enumerate(model.layers):
         parallelize_plan=layer_tp_plan
     )
 
+'''
+PM  Device Mesh created: DeviceMesh('cuda', [[0, 1]], mesh_dim_names=('dp', 'tp'))
+model_args.sp_size: 1, world_size: 2
+PM  Model after parallelization FSDPTransformer(
+  (tok_embeddings): Embedding(320, 256)
+  (layers): ModuleList(
+    (0-1): 2 x TransformerBlock(
+      (attention): Attention(
+        (wq): Linear(in_features=256, out_features=256, bias=False)
+        (wk): Linear(in_features=256, out_features=256, bias=False)
+        (wv): Linear(in_features=256, out_features=256, bias=False)
+        (wo): Linear(in_features=256, out_features=256, bias=False)
+      )
+      (feed_forward): FeedForward(
+        (w1): Linear(in_features=256, out_features=768, bias=False)
+        (w2): Linear(in_features=768, out_features=256, bias=False)
+        (w3): Linear(in_features=256, out_features=768, bias=False)
+      )
+      (attention_norm): RMSNorm()
+      (ffn_norm): RMSNorm()
+    )
+  )
+  (norm): RMSNorm()
+  (output): Linear(in_features=256, out_features=320, bias=False)
+)
+'''
+
 # Init FSDP using the dp device mesh
 sharded_model = fully_shard(model, mesh=dp_mesh)
 
