@@ -20,7 +20,9 @@ class Model(torch.nn.Module):
 
 def export():
     with torch.no_grad():
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        # device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cpu"  # 强制使用 CPU
+        print(f"Exporting model for device: {device}")
         model = Model().to(device=device)
         example_inputs=(torch.randn(8, 10, device=device),)
         batch_dim = torch.export.Dim("batch", min=1, max=1024)
@@ -33,10 +35,12 @@ def export():
         print(f"Model exported and compiled to {output_path}")
 
 def load():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu"  # 强制使用 CPU
+    print(f"Loading model for device: {device}")
     model = torch._inductor.aoti_load_package(os.path.join(os.getcwd(), "model.pt2"))
     print(model(torch.randn(8, 10, device=device)))
 
 if __name__ == "__main__":
-    # export()
+    export()
     load()

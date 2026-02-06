@@ -1,4 +1,6 @@
-#include <c10d/ProcessGroupMPI.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroupMPI.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/torch.h>
 #include <iostream>
 
@@ -35,8 +37,8 @@ struct Model : torch::nn::Module {
 };
 
 void waitWork(
-    std::shared_ptr<c10d::ProcessGroupMPI> pg,
-    std::vector<std::shared_ptr<c10d::ProcessGroup::Work>> works) {
+    c10::intrusive_ptr<c10d::ProcessGroupMPI> pg,
+    std::vector<c10::intrusive_ptr<c10d::Work>> works) {
   for (auto& work : works) {
     try {
       work->wait();
@@ -48,6 +50,8 @@ void waitWork(
 }
 
 int main(int argc, char* argv[]) {
+  auto tensor = at::ones({16, 16}) * 1;
+
   // Creating MPI Process Group
   auto pg = c10d::ProcessGroupMPI::createProcessGroupMPI();
 
@@ -86,7 +90,9 @@ int main(int argc, char* argv[]) {
   torch::optim::SGD optimizer(model->parameters(), learning_rate);
 
   // Number of epochs
-  size_t num_epochs = 10;
+  size_t num_epochs = 1;
+
+  std::cout << "numranks " << numranks << " rank " << rank << " number of epochs: " << num_epochs << std::endl;
 
   for (size_t epoch = 1; epoch <= num_epochs; ++epoch) {
     size_t num_correct = 0;
@@ -115,7 +121,7 @@ int main(int argc, char* argv[]) {
       // since this synchronizes parameters after backward pass while DDP
       // overlaps synchronizing parameters and computing gradients in backward
       // pass
-      std::vector<std::shared_ptr<::c10d::ProcessGroup::Work>> works;
+      std::vector<c10::intrusive_ptr<::c10d::Work>> works;
       for (auto& param : model->named_parameters()) {
         std::vector<torch::Tensor> tmp = {param.value().grad()};
         auto work = pg->allreduce(tmp);
@@ -133,6 +139,7 @@ int main(int argc, char* argv[]) {
 
       auto guess = prediction.argmax(1);
       num_correct += torch::sum(guess.eq_(op)).item<int64_t>();
+      break; // for testing purpose, run only one batch
     } // end batch loader
 
     auto accuracy = 100.0 * num_correct / num_train_samples_per_proc;
