@@ -380,9 +380,10 @@ int main(int argc, char* argv[]) {
     std::cout << "========================================" << std::endl;
   }
 
-  // 测试 1: 原始模型（只在 rank 0）
+  // 测试 1: 原始模型推理（使用模型内部的 Attention）
   torch::Tensor output_original;
   if (rank == 0) {
+    std::cout << "Running original model inference..." << std::endl;
     torch::NoGradGuard no_grad;
     std::vector<torch::jit::IValue> inputs;
     inputs.push_back(tokens);
@@ -400,67 +401,86 @@ int main(int argc, char* argv[]) {
               << std::endl;
   }
 
-  // 测试 2: 验证 SP Attention 正确性
+  // 测试 2: 使用模块化方法替换 Attention
   if (rank == 0) {
     std::cout << "\n========================================" << std::endl;
-    std::cout << "Test 2: SP vs No-SP Verification" << std::endl;
+    std::cout << "Test 2: Model with SP Attention (Modular)" << std::endl;
     std::cout << "========================================" << std::endl;
+    std::cout << "✅ Using exported get_attention_input() and forward_with_custom_attention()" << std::endl;
+    std::cout << "✅ No need to manually rebuild model pipeline!" << std::endl;
   }
 
-  // 模拟 embedding 输出（所有rank相同的输入）
-  torch::manual_seed(42);
-  auto h_full = torch::randn({batch_size, seq_len, d_model}, device);
+  // 使用模块化接口替换 Attention
+  torch::Tensor output_with_sp;
 
-  // ===== 方法 1: 不使用 SP (baseline) =====
-  torch::Tensor output_no_sp;
-  if (rank == 0) {
-    std::cout << "\n[Method 1: Standard Attention (No SP)]" << std::endl;
-    std::cout << "  Input shape: " << h_full.sizes() << std::endl;
-
-    torch::NoGradGuard no_grad;
-    auto start = std::chrono::high_resolution_clock::now();
-    output_no_sp = sp_attention.forward_no_sp(h_full);
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration =
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-
-    std::cout << "  Output shape: " << output_no_sp.sizes() << std::endl;
-    std::cout << "  Time: " << duration.count() / 1000.0 << " ms" << std::endl;
-  }
-
-  // ===== 方法 2: 使用 SP =====
-  if (rank == 0) {
-    std::cout << "\n[Method 2: Sequence Parallel Attention]" << std::endl;
-  }
-
-  // 切分序列到各个 rank
-  int64_t local_seq_len = seq_len / world_size;
-  auto h_local =
-      h_full.slice(1, rank * local_seq_len, (rank + 1) * local_seq_len)
-          .contiguous();
-
-  if (rank == 0) {
-    std::cout << "  Full sequence shape: " << h_full.sizes() << std::endl;
-    std::cout << "  Local sequence shape (per rank): " << h_local.sizes()
-              << std::endl;
-  }
-
-  // SP Attention forward
+  // 所有 ranks 都参与计算
   torch::NoGradGuard no_grad;
 
-  auto start = std::chrono::high_resolution_clock::now();
-  auto attn_out_local = sp_attention.forward(h_local, world_size, true);
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration =
-      std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  // 广播 tokens 到所有 ranks
+  torch::Tensor tokens_all;
+  if (rank == 0) {
+    tokens_all = tokens;
+  } else {
+    tokens_all = torch::zeros({batch_size, seq_len}, torch::TensorOptions().dtype(torch::kLong).device(device));
+  }
+  std::vector<torch::Tensor> tokens_vec = {tokens_all};
+  pg->broadcast(tokens_vec)->wait();
+  tokens_all = tokens_vec[0];
 
-  // AllGather 恢复完整序列
-  auto output_sp = all_gather(attn_out_local, /*gather_dim=*/1, pg);
+  // 1. 调用模型的 get_attention_input 方法
+  auto get_attn_input_method = model.get_method("get_attention_input");
+  auto attn_input_result = get_attn_input_method({tokens_all});
+  auto attn_input = attn_input_result.toTuple()->elements()[0].toTensor();
+  auto residual = attn_input_result.toTuple()->elements()[1].toTensor();
 
   if (rank == 0) {
-    std::cout << "\nAfter AllGather: " << output_sp.sizes() << std::endl;
-    std::cout << "SP Attention Time: " << duration.count() / 1000.0 << " ms"
-              << std::endl;
+    std::cout << "\n[Step 1: Get Attention Input]" << std::endl;
+    std::cout << "  Attention input: " << attn_input.sizes() << std::endl;
+    std::cout << "  Residual: " << residual.sizes() << std::endl;
+  }
+
+  // 2. 使用自定义 SP Attention 计算
+  torch::Tensor attn_output;
+
+  if (world_size > 1) {
+    // 切分序列到各个 rank
+    int64_t local_seq_len = seq_len / world_size;
+    auto attn_input_local = attn_input.slice(1, rank * local_seq_len, (rank + 1) * local_seq_len).contiguous();
+
+    if (rank == 0) {
+      std::cout << "\n[Step 2: SP Attention]" << std::endl;
+      std::cout << "  Splitting sequence: " << attn_input.sizes() << " -> " << attn_input_local.sizes() << std::endl;
+    }
+
+    // SP Attention forward
+    auto start_sp = std::chrono::high_resolution_clock::now();
+    auto attn_output_local = sp_attention.forward(attn_input_local, world_size, rank == 0);
+    auto end_sp = std::chrono::high_resolution_clock::now();
+    auto duration_sp = std::chrono::duration_cast<std::chrono::microseconds>(end_sp - start_sp);
+
+    // AllGather 恢复完整序列
+    attn_output = all_gather(attn_output_local, /*gather_dim=*/1, pg);
+
+    if (rank == 0) {
+      std::cout << "  After SP attention + AllGather: " << attn_output.sizes() << std::endl;
+      std::cout << "  SP Attention time: " << duration_sp.count() / 1000.0 << " ms" << std::endl;
+    }
+  } else {
+    // 单进程：使用标准 Attention
+    attn_output = sp_attention.forward_no_sp(attn_input);
+    if (rank == 0) {
+      std::cout << "\n[Step 2: Standard Attention]" << std::endl;
+      std::cout << "  Attention output: " << attn_output.sizes() << std::endl;
+    }
+  }
+
+  // 3. 调用模型的 forward_with_custom_attention 继续
+  auto forward_custom_method = model.get_method("forward_with_custom_attention");
+  output_with_sp = forward_custom_method({attn_output, residual}).toTensor();
+
+  if (rank == 0) {
+    std::cout << "\n[Step 3: Continue Model Forward]" << std::endl;
+    std::cout << "  Final output: " << output_with_sp.sizes() << std::endl;
   }
 
   // ===== 验证结果 =====
@@ -470,43 +490,36 @@ int main(int argc, char* argv[]) {
     std::cout << "========================================" << std::endl;
 
     // 计算差异
-    auto diff = torch::abs(output_sp - output_no_sp);
+    auto diff = torch::abs(output_with_sp - output_original);
     auto max_diff = torch::max(diff).item<float>();
     auto mean_diff = torch::mean(diff).item<float>();
 
-    // 相对误差
-    auto relative_diff = diff / (torch::abs(output_no_sp) + 1e-8);
-    auto max_relative = torch::max(relative_diff).item<float>();
-    auto mean_relative = torch::mean(relative_diff).item<float>();
+    std::cout << "\nComparing:" << std::endl;
+    std::cout << "  Original model output:      " << output_original.sizes() << std::endl;
+    std::cout << "  Model with SP attention:    " << output_with_sp.sizes() << std::endl;
 
     std::cout << "\nNumerical Difference:" << std::endl;
     std::cout << "  Max absolute diff:  " << max_diff << std::endl;
     std::cout << "  Mean absolute diff: " << mean_diff << std::endl;
-    std::cout << "  Max relative diff:  " << max_relative << std::endl;
-    std::cout << "  Mean relative diff: " << mean_relative << std::endl;
 
     // 判断是否通过
-    float atol = 1e-5; // absolute tolerance
-    float rtol = 1e-4; // relative tolerance
-    bool passed = (max_diff < atol) || (max_relative < rtol);
+    float atol = 1e-4; // absolute tolerance
+    bool passed = (max_diff < atol);
 
     std::cout << "\nTolerance Settings:" << std::endl;
     std::cout << "  Absolute tolerance: " << atol << std::endl;
-    std::cout << "  Relative tolerance: " << rtol << std::endl;
 
     if (passed) {
-      std::cout << "\n✅ PASSED: SP and No-SP outputs match!" << std::endl;
+      std::cout << "\n✅ PASSED: Original model and SP-replaced model outputs match!" << std::endl;
     } else {
       std::cout << "\n❌ FAILED: Outputs differ significantly!" << std::endl;
     }
 
     // 显示样本值
-    std::cout << "\nSample Values (first 3 elements):" << std::endl;
-    std::cout << "  No-SP:  " << output_no_sp.flatten().slice(0, 0, 3)
-              << std::endl;
-    std::cout << "  SP:     " << output_sp.flatten().slice(0, 0, 3)
-              << std::endl;
-    std::cout << "  Diff:   " << diff.flatten().slice(0, 0, 3) << std::endl;
+    std::cout << "\nSample Values:" << std::endl;
+    std::cout << "  Original:  " << output_original << std::endl;
+    std::cout << "  With SP:   " << output_with_sp << std::endl;
+    std::cout << "  Diff:      " << diff << std::endl;
   }
 
   // 同步

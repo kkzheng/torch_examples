@@ -40,12 +40,25 @@ target_link_libraries(torch-infer-ulysses-sp ${TORCH_LIBRARIES})
 target_link_libraries(torch-infer-ulysses-sp ${MPI_LIBRARIES})
 target_compile_definitions(torch-infer-ulysses-sp PRIVATE USE_C10D_MPI)
 
+# torch.export model inference example
+add_executable(torch-export-infer torch_export_infer.cpp)
+target_link_libraries(torch-export-infer ${TORCH_LIBRARIES})
+
+# torch.export Tensor Parallel inference with MPI
+add_executable(torch-export-tp-mpi-infer torch_export_tp_mpi_infer.cpp)
+target_link_libraries(torch-export-tp-mpi-infer ${TORCH_LIBRARIES})
+target_link_libraries(torch-export-tp-mpi-infer ${MPI_LIBRARIES})
+target_compile_definitions(torch-export-tp-mpi-infer PRIVATE USE_C10D_MPI)
+
+
 if(MPI_COMPILE_FLAGS)
   set_target_properties(dist-mnist PROPERTIES
     COMPILE_FLAGS "${MPI_COMPILE_FLAGS}")
   set_target_properties(tp-demo-infer PROPERTIES
     COMPILE_FLAGS "${MPI_COMPILE_FLAGS}")
   set_target_properties(sp-demo-infer PROPERTIES
+    COMPILE_FLAGS "${MPI_COMPILE_FLAGS}")
+  set_target_properties(torch-export-tp-mpi-infer PROPERTIES
     COMPILE_FLAGS "${MPI_COMPILE_FLAGS}")
 endif()
 
@@ -55,5 +68,7 @@ if(MPI_LINK_FLAGS)
   set_target_properties(tp-demo-infer PROPERTIES
     LINK_FLAGS "${MPI_LINK_FLAGS}")
   set_target_properties(sp-demo-infer PROPERTIES
+    LINK_FLAGS "${MPI_LINK_FLAGS}")
+  set_target_properties(torch-export-tp-mpi-infer PROPERTIES
     LINK_FLAGS "${MPI_LINK_FLAGS}")
 endif()
